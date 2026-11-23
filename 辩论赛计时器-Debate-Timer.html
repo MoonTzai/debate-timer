@@ -1674,6 +1674,318 @@ html[data-stage-kind="display"] .app{height:100vh;height:100dvh}
 }
 
 </style>
+<script>
+/*
+COACH_FILE_IO_ARCHITECTURE_CONTRACT_BEGIN
+R01 SINGLE-FILE COACH FILE DELIVERY CONTRACT (source-owned, not a help page).
+SCOPE: createCoachFileIO(environment) is the one shared file delivery/receipt service,
+installed as window.DCFileIO in the executable Coach shell. AI Recorder is excluded.
+OWNERSHIP: Module producers alone own payload bytes, original name, MIME, JSON
+schema, IDs, links, history, session state and import validation/commit.
+The service accepts a canonical Blob once; it does NOT serialize JSON, repair
+invalid inputs, alter report content, commit a project, or inspect prompts.
+API: present(PreparedFile) offers supported actions; deliver(PreparedFile,
+'download'|'share'|'save-local') performs exactly one intent; openPreview()
+starts read-only HTML preview; standaloneSource() emits this same self-contained
+factory for Atlas/Startrack offline reports. PreparedFile: {blob,name,mime,kind,
+owner,lang,nativeLocation:{directory,folder},profile:'ordinary'|'timer'}.
+Receipt.status: download-started, preview-open-started, share-returned, saved,
+cancelled, share-not-completed, unsupported, failed. A resolved Promise or an
+anchor.click does not establish that the destination file was saved.
+WEB: iOS HTTPS uses navigator.share({files:[File]}) ONLY, never title/text;
+JSON/MD may use text/plain MIME without changing extension. Android Web JSON/MD
+share uses byte-identical .json.txt/.md.txt and text/plain regardless of
+canShare(original); original extension is retained for downloads. Unsupported
+Web Share falls back to a *user-selected* download, not a silent retry. Explicit
+cancellation/failure NEVER auto-downloads. Asynchronously prepared exports wait
+for a NEW user click before Web Share; no await before navigator.share.
+NATIVE: Use existing Capacitor Filesystem -> URI -> Share or test-only LocalSave
+(SAF). Write raw Blob bytes in <=256 KiB slices, Base64 encode each slice, await
+writeFile then serial appendFile without encoding. Verify raw byte count/stat;
+Timer uses partial -> stat -> rename -> URI while ordinary files use the prior
+direct target. Preserve original per-module DOCUMENTS/CACHE folder. Do not
+decode entire Blob as text, build whole-file Base64, or share partial files.
+INPUT: JSON can be carried in .json/.txt/.md only if the ENTIRE contents parse
+as JSON (remove only one leading BOM); original module parser/validator commits
+or rejects. Genuine Markdown reports (especially Judge) have independent
+report import paths; no code-fence extraction or LLM JSON repair.
+FILE MATRIX: JSON/MD/TXT/HTML/CSV/SVG keep actual bytes/MIME; XLSX, JPG,
+PNG/audio/other binary MUST keep real bytes and extensions, never TXT aliases.
+No new PDF/ZIP generators are implied; existing HTML preview/print is separate.
+LARGE TIMER: ordinary format <=5 MiB; portable JSON <=96 MiB; display-image
+library single image <=80 MiB and total <=256 MiB is a different data domain.
+8 MiB selects Timer's dedicated large-file *import parser*, not an export cap.
+Android Chromium browser Web Share currently gates files over 50 MiB to the
+normal download action; this is NOT a Timer generation/import limit. Never
+change MATCH/FORMAT, clocks, sounds, media inclusion semantics, canvas or
+explicit settings application in an I/O change.
+FAILURES: One prepared file, one user intent, one Receipt. Cancelled share or SAF
+save must not report success or cause a second action. No global a.click/Blob/
+JSON.parse intercepts, duplicate delivery services, extra schema engine,
+persistent file cache, external file dependency, or Recorder coupling.
+MAINTENANCE: When changing a service interface, edit this comment; when a
+module exception changes, edit its FILE_IO_ADAPTER comment near the real code.
+Real execution code and current project rules outrank stale comments/line IDs.
+COACH_FILE_IO_ARCHITECTURE_CONTRACT_END
+*/
+function createCoachFileIO(environment) {
+  'use strict';
+  const host=environment||window;
+  const held=new Map();
+  let sequence=0;
+  const BUCKET=256*1024;
+  const allowed=new Set(['download','share','save-local']);
+  const isNative=()=>{
+    try {return !!(host.Capacitor&&host.Capacitor.isNativePlatform&&host.Capacitor.isNativePlatform());}
+    catch(_) {return false;}
+  };
+  const lang=file=>file.lang==='en'?'en':'zh';
+  const say=(file,zh,en)=>lang(file)==='en'?en:zh;
+  const filename=str=>String(str||'Export').replace(/[\\/:*?"<>|\u0000-\u001f]/g,'-').trim()||'Export';
+  const mimeOf=(file)=>String(file.mime||file.blob?.type||'application/octet-stream');
+  const kindOf=file=>{
+    if(file.kind&&file.kind!=='ordinary'&&file.kind!=='timer')return file.kind;
+    const ext=String(file.name).toLowerCase().split('.').pop();
+    return ({json:'json',md:'markdown',txt:'text',html:'html',htm:'html',
+      csv:'csv',svg:'svg',png:'image',jpg:'image',jpeg:'image',xlsx:'binary'})[ext]||'binary';
+  };
+  function prepare(input) {
+    if(!input||!input.blob||typeof input.blob.slice!=='function'||!Number.isFinite(input.blob.size))
+      throw Error('A prepared Blob is required');
+    return {...input,name:filename(input.name),mime:mimeOf(input),kind:kindOf(input)};
+  }
+  function receipt(file,status,method,extra) {
+    return Object.freeze({status,method,originalName:file.name,bytes:file.blob.size,...(extra||{})});
+  }
+  function message(r,file){
+    const en=lang(file)==='en';
+    const labels={
+      'download-started':en?'Download started; check your downloads folder.':'已发起下载，请检查下载目录。',
+      'preview-open-started':en?'Preview opening was requested.':'已发起预览，请检查新窗口。',
+      'share-returned':en?'System share returned; verify the destination file.':'系统分享流程已返回，请确认目标应用中的文件。',
+      saved:en?'File saved to the selected location.':'文件已保存到选择的位置。',
+      cancelled:en?'Action cancelled; no download was started.':'已取消，未自动下载。',
+      'share-not-completed':en?'System share did not complete; no download was started.':'系统分享未完成，未自动下载。',
+      unsupported:en?'This action is unsupported; select Download.':'当前环境不支持该操作，请选择下载。',
+      failed:en?'File operation failed; retry explicitly.':'文件操作失败，请自行选择重试。'
+    };
+    return labels[r.status]||r.message||'';
+  }
+  function capability(file){
+    const native=isNative(),nav=host.navigator||{},mobile=/Android|iPhone|iPad|iPod/i.test(String(nav.userAgent||''))||
+      (/Macintosh/i.test(String(nav.userAgent||''))&&Number(nav.maxTouchPoints||0)>1);
+    const androidWeb=!native&&/Android/i.test(String(nav.userAgent||''));
+    let share=!!(native&&host.Capacitor?.Plugins?.Share?.share);
+    if(!native&&mobile&&host.isSecureContext!==false&&typeof nav.share==='function'&&
+       typeof nav.canShare==='function'&&typeof host.File==='function'&&
+       (!androidWeb||file.blob.size<=50*1024*1024)){
+      try {
+        const type=(androidWeb&&['json','markdown'].includes(file.kind))?'text/plain':file.mime;
+        const name=(androidWeb&&['json','markdown'].includes(file.kind))?file.name+'.txt':file.name;
+        share=!!nav.canShare({files:[new host.File([file.blob],name,{type})]});
+        if(!share&&!androidWeb&&['json','markdown'].includes(file.kind))
+          share=!!nav.canShare({files:[new host.File([file.blob],file.name,{type:'text/plain'})]});
+      }catch(_) {share=false;}
+    }
+    const local=!!(native&&host.Capacitor?.Plugins?.LocalSave?.saveDocument);
+    return {native,mobile,androidWeb,share,local};
+  }
+  function webDownload(file){
+    let url=null,link=null;
+    try{
+      url=host.URL.createObjectURL(file.blob);
+      link=host.document.createElement('a');
+      link.href=url;link.download=file.name;link.style.cssText='position:fixed;top:-9999px;left:0';
+      (host.document.body||host.document.documentElement).appendChild(link);
+      link.click();
+      return receipt(file,'download-started','browser-download');
+    }catch(e){return receipt(file,'failed','browser-download',{errorName:e.name,message:String(e.message||e)});}
+    finally{
+      if(url||link)host.setTimeout(()=>{
+        try{link?.remove();}catch(_){}try{if(url)host.URL.revokeObjectURL(url);}catch(_){}
+      },30000);
+    }
+  }
+  // Called from a fresh click; call navigator.share before any await.
+  function webShare(file,cap){
+    const nav=host.navigator;
+    if(!cap.share)return Promise.resolve(receipt(file,'unsupported','web-share'));
+    try{
+      const androidTxt=cap.androidWeb&&['json','markdown'].includes(file.kind);
+      let name=androidTxt?file.name+'.txt':file.name;
+      let type=androidTxt?'text/plain':file.mime;
+      let shareFile=new host.File([file.blob],name,{type});
+      if(!nav.canShare({files:[shareFile]})&&!androidTxt&&['json','markdown'].includes(file.kind)){
+        type='text/plain';
+        shareFile=new host.File([file.blob],name,{type});
+      }
+      if(!nav.canShare({files:[shareFile]}))return Promise.resolve(receipt(file,'unsupported','web-share'));
+      const pending=nav.share({files:[shareFile]}); // files-only: iOS contract
+      return Promise.resolve(pending).then(
+        ()=>receipt(file,'share-returned','web-share',{deliveredName:name}),
+        e=>receipt(file,e?.name==='AbortError'?'share-not-completed':'failed','web-share',
+          {errorName:e?.name||'Error',message:String(e?.message||e),deliveredName:name}));
+    }catch(e){return Promise.resolve(receipt(file,'failed','web-share',{errorName:e.name,message:String(e.message||e)}));}
+  }
+  function encode64(array){
+    let binary='';
+    for(let i=0;i<array.length;i+=8192)
+      binary+=String.fromCharCode.apply(null,array.subarray(i,i+8192));
+    return host.btoa(binary);
+  }
+  async function writeNativeBlob(file,session){
+    const C=host.Capacitor,FS=C?.Plugins?.Filesystem;
+    if(!FS||typeof FS.writeFile!=='function'||typeof FS.appendFile!=='function'||
+       typeof FS.stat!=='function'||typeof FS.getUri!=='function')
+      throw Error('Native Filesystem byte operations unavailable');
+    const loc=file.nativeLocation;
+    if(!loc||!['DOCUMENTS','CACHE'].includes(String(loc.directory))||
+       !loc.folder||!/^[-\w/]+$/.test(loc.folder))
+      throw Error('Missing audited nativeLocation');
+    const dir=loc.directory,final=loc.folder.replace(/\/+$/,'')+'/'+file.name;
+    const key=dir+':'+final;
+    const occupant=held.get(key);
+    if(occupant&&occupant!==session)throw Error('This file is being delivered by another session');
+    held.set(key,session);
+    session.pathKey=key;
+    if(session.artifact)return session.artifact;
+    const timer=file.profile==='timer',tmp=timer?final+'.partial-'+(++sequence).toString(36):final;
+    let written=0;
+    try{
+      if(timer&&typeof FS.rename!=='function')throw Error('Timer rename unavailable');
+      if(file.blob.size===0){
+        await FS.writeFile({path:tmp,data:'',directory:dir,recursive:true});
+      }else{
+        for(let off=0;off<file.blob.size;off+=BUCKET){
+          const buf=new Uint8Array(await file.blob.slice(off,Math.min(file.blob.size,off+BUCKET)).arrayBuffer());
+          const data=encode64(buf);
+          if(off===0)await FS.writeFile({path:tmp,data,directory:dir,recursive:true});
+          else await FS.appendFile({path:tmp,data,directory:dir});
+          written+=buf.byteLength;
+        }
+      }
+      if(written!==file.blob.size)throw Error('Native chunk size mismatch');
+      const stat=await FS.stat({path:tmp,directory:dir});
+      if(Number(stat?.size)!==file.blob.size)throw Error('Native stored bytes mismatch');
+      if(timer)await FS.rename({from:tmp,to:final,directory:dir,toDirectory:dir});
+      const uri=(await FS.getUri({path:final,directory:dir}))?.uri;
+      if(!uri)throw Error('Native file URI missing');
+      session.artifact={uri,bytes:written,path:final,directory:dir};
+      return session.artifact;
+    }catch(e){
+      if(timer)try{await FS.deleteFile({path:tmp,directory:dir});}catch(_){}
+      throw e;
+    }
+  }
+  async function deliver(input,intent='download',options={}){
+    let file;
+    try{file=prepare(input);}catch(e){return {status:'failed',method:'prepare',message:String(e.message||e),bytes:0};}
+    if(!allowed.has(intent))return receipt(file,'unsupported','unknown-intent');
+    const cap=capability(file);
+    if(!cap.native){
+      if(intent==='download')return webDownload(file);
+      if(intent==='share')return webShare(file,cap);
+      return receipt(file,'unsupported','web-save-location');
+    }
+    if(intent==='download')return receipt(file,'unsupported','native-download');
+    if(intent==='share'&&!cap.share||intent==='save-local'&&!cap.local)
+      return receipt(file,'unsupported','native-plugin');
+    const session=options.session||{pathKey:null,artifact:null};
+    const own=!options.session;
+    try{
+      const artifact=await writeNativeBlob(file,session);
+      if(intent==='share'){
+        try{
+          await host.Capacitor.Plugins.Share.share({files:[artifact.uri]});
+          return receipt(file,'share-returned','native-share',
+            {nativeFileWritten:true,nativeUri:artifact.uri});
+        }catch(e){return receipt(file,e?.name==='AbortError'?'share-not-completed':'failed','native-share',
+          {nativeFileWritten:true,nativeUri:artifact.uri,errorName:e?.name,message:String(e?.message||e)});}
+      }
+      try{
+        const data=await host.Capacitor.Plugins.LocalSave.saveDocument({
+          sourceUri:artifact.uri,name:file.name,mimeType:file.mime});
+        if(data?.canceled||data?.cancelled)return receipt(file,'cancelled','native-local-save',
+          {nativeFileWritten:true,nativeUri:artifact.uri});
+        if(data?.saved&&Number(data.bytes)===file.blob.size)
+          return receipt(file,'saved','native-local-save',{nativeFileWritten:true,nativeUri:artifact.uri});
+        throw Error('Local save did not confirm byte-complete closed stream');
+      }catch(e){return receipt(file,e?.name==='AbortError'?'cancelled':'failed','native-local-save',
+        {nativeFileWritten:true,nativeUri:artifact.uri,errorName:e?.name,message:String(e?.message||e)});}
+    }catch(e){return receipt(file,'failed','native-write',{errorName:e?.name,message:String(e?.message||e)});}
+    finally{if(own&&session.pathKey)held.delete(session.pathKey);}
+  }
+  function present(input,options={}){
+    let file;
+    try{file=prepare(input);}catch(e){return Promise.resolve({status:'failed',method:'prepare',message:String(e.message||e)});}
+    const cap=capability(file);
+    if(!cap.mobile&&!cap.native)return deliver(file,'download');
+    const doc=host.document;
+    if(!doc||!doc.body)return deliver(file,cap.native?'share':'download');
+    return new Promise(resolve=>{
+      const session={pathKey:null,artifact:null};
+      const layer=doc.createElement('div');
+      layer.style.cssText='position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:16px';
+      const box=doc.createElement('div');
+      // FILE_IO_ADAPTER: delivery dialog --surface is translucent; choose opaque theme tokens instead.
+      box.style.cssText='background:var(--bg1,#fff);color:var(--ink,#222);border-radius:14px;padding:20px;max-width:440px;width:100%;box-shadow:0 20px 60px #0004;display:grid;gap:10px;font:14px/1.5 system-ui,sans-serif';
+      const head=doc.createElement('div');head.textContent=say(file,'文件已准备好，请选择交付方式','File ready. Choose a delivery method.');
+      head.style.cssText='font-size:17px;font-weight:700';
+      const detail=doc.createElement('div');detail.textContent=file.name+' ('+file.blob.size+' bytes)';
+      detail.style.cssText='overflow-wrap:anywhere;font-size:12px;opacity:.75';
+      const info=doc.createElement('div');info.setAttribute('role','status');info.style.cssText='font-size:13px;min-height:20px;overflow-wrap:anywhere';
+      box.append(head,detail);
+      let active=false,closed=false,last=null;
+      const buttons=[];
+      function finish(){
+        if(closed)return;
+        if(active)return;
+        closed=true;layer.remove();
+        if(session.pathKey)held.delete(session.pathKey);
+        resolve(last||receipt(file,'cancelled','dialog'));
+      }
+      function add(label,intent){
+        const btn=doc.createElement('button');
+        btn.type='button';btn.textContent=label;btn.style.cssText='padding:11px;border:1px solid #aaa;border-radius:8px;background:var(--bg0,#f4f6fb);color:inherit;cursor:pointer;font:inherit';
+        btn.addEventListener('click',()=>{
+          if(intent==='close'){finish();return;}
+          if(active)return;active=true;for(const b of buttons)b.disabled=true;
+          // Call deliver immediately under user activation, before any await.
+          Promise.resolve(deliver(file,intent,{session})).then(r=>{
+            last=r;info.textContent=message(r,file)+(r.deliveredName&&r.deliveredName!==file.name?' '+r.deliveredName:'');
+            if(typeof options.onReceipt==='function')try{options.onReceipt(r);}catch(_){}
+          }).catch(e=>{last=receipt(file,'failed',intent,{message:String(e?.message||e)});info.textContent=message(last,file);})
+            .finally(()=>{active=false;for(const b of buttons)b.disabled=false;});
+        });
+        box.appendChild(btn);buttons.push(btn);return btn;
+      }
+      if(!cap.native)add(say(file,'下载原文件','Download original file'),'download');
+      if(cap.share)add(say(file,cap.androidWeb&&['json','markdown'].includes(file.kind)?'分享TXT兼容副本':'分享文件','Share file'),'share');
+      if(cap.local)add(say(file,'另存为（选择文件位置）','Save as (choose location)'),'save-local');
+      add(say(file,'完成 / 取消','Done / Cancel'),'close');
+      box.appendChild(info);layer.appendChild(box);doc.body.appendChild(layer);
+      layer.addEventListener('click',e=>{if(e.target===layer)finish();});
+    });
+  }
+  function openPreview(input) {
+    let file;try{file=prepare(input);}catch(e){return {status:'failed',method:'preview',message:String(e.message||e)};}
+    try{
+      const url=host.URL.createObjectURL(file.blob);
+      const w=host.open(url,'_blank');
+      host.setTimeout(()=>{try{host.URL.revokeObjectURL(url);}catch(_){}},30000);
+      return receipt(file,w?'preview-open-started':'failed','web-preview');
+    }catch(e){return receipt(file,'failed','web-preview',{message:String(e.message||e)});}
+  }
+  function standaloneSource(){
+    return '(function(){window.DCFileIO=('+createCoachFileIO.toString()+')(window);})();';
+  }
+  return Object.freeze({present,deliver,openPreview,standaloneSource,message,capability,
+    readJsonText:text=>JSON.parse(String(text).replace(/^\uFEFF/,''))});
+}
+
+if(window.Capacitor?.isNativePlatform?.()&&typeof window.Capacitor.registerPlugin==="function") window.Capacitor.registerPlugin("LocalSave");
+window.DCFileIO=createCoachFileIO(window);
+</script>
 </head>
 <body class="v0">
 <div id="fc-floor"><div class="sky"></div>
@@ -5880,13 +6192,14 @@ function showExport(root,onClose){
  document.addEventListener('keydown',key,true);
  modal.addEventListener('click',e=>e.stopPropagation());modal.querySelector('[data-dual-export-cancel]').onclick=close;
  const resultText=r=>{
-  if(r.status==='native-saved-and-shared')return W.r6UI('文件已保存到应用文档，系统分享流程已返回：')+r.path;
-  if(r.status.startsWith('native-saved'))return W.r6UI('已保存到应用文档：')+r.path+W.r6UI('；分享未完成或不可用。');
-  if(r.status==='web-shared')return W.r6UI('系统文件分享流程已返回：')+r.name;
-  if(r.status==='web-share-canceled')return W.r6UI('已取消文件分享，未启动额外下载');
-  if(r.status==='browser-download-started')return W.r6UI('已发起下载，请检查浏览器保存结果。')+
-   (r.nativeError?' '+W.r6UI('原生保存失败：')+r.nativeError:'');
-  return W.r6UI('导出失败：')+r.status;
+  var s=r.status||"failed",name=r.originalName||r.name||"";
+  if(s==="share-returned")return W.r6UI("系统分享已返回，请核对接收位置：")+name;
+  if(s==="saved")return W.r6UI("已保存到选择的文件位置：")+name;
+  if(s==="download-started")return W.r6UI("已发起下载，请检查浏览器保存结果。");
+  if(s==="cancelled")return W.r6UI("已取消另存为，未自动下载。");
+  if(s==="share-not-completed")return W.r6UI("系统分享未完成，未自动下载。");
+  if(s==="unsupported")return W.r6UI("当前环境不支持该操作，请选择下载原文件。");
+  return W.r6UI("导出失败：")+(r.message||r.errorName||s);
  };
  const deliver=async()=>{
   if(working||!prepared)return;
@@ -7118,7 +7431,7 @@ function renderStart(m){
   h+='</div>';
   h+='<div class="hero-display"><div class="start-display-slot" id="start-display-slot"></div><button class="btn ghost" id="r6-layout-open" onclick="DualMode.openSettings()">'+ic('layers')+'<span>'+(LANG==='en'?'Layout Settings':'布局设置')+'</span></button></div>';
   if(FORMAT)h+='<div class="hero-links"><button class="btn ghost" onclick="newFormat()">'+ic('plus')+'<span>'+t('newFormat')+'</span></button><span class="hero-links-sep" aria-hidden="true">·</span><button class="btn ghost" onclick="openImportFormatMenu()">'+ic('upload')+'<span>'+t('loadFile')+'</span></button></div>';
-  h+='</div><input type="file" id="load-fmt" accept=".json" class="hidden" onchange="loadFormatFile(this)">';
+  h+='</div><input type="file" id="load-fmt" accept=".json,.txt,.md,application/json,text/plain,text/markdown" class="hidden" onchange="loadFormatFile(this)">';
   h+=timerShortcutMarkup();
   h+='</div><div class="side-col">';
   if(FORMAT){
@@ -7169,12 +7482,11 @@ async function exportFormat(){
   if(typeof deliver!=='function')throw Error('统一配置导出模块尚未就绪');
   var result=await deliver(blob,fname);
   var status=result.status;
-  if(status==='native-saved-and-shared')toast(t('nativeSaved')+result.path);
-  else if(status.startsWith('native-saved'))notice(t('nativeSavedNoShare')+result.path);
-  else if(status==='web-shared')toast(t('webShareReturned')+fname);
-  else if(status==='web-share-canceled')toast(t('webShareCanceled'));
-  else if(status==='browser-download-started')toast((result.nativeError?t('nativeFallback'):t('downloadStarted'))+fname);
-  else notice(t('exportFail')+status);
+  if(status==="download-started")toast(t("downloadStarted")+fname);
+  else if(status==="share-returned")toast(t("webShareReturned")+fname);
+  else if(status==="saved")toast(t("nativeSaved")+fname);
+  else if(status==="cancelled"||status==="share-not-completed")toast(t("webShareCanceled"));
+  else notice(t("exportFail")+(result.message||status));
   return result;
  }catch(e){notice(t('exportFail')+String(e.message||e));return {status:'failed',error:String(e)};}
 }
@@ -7300,7 +7612,7 @@ function openImportFormatMenu(){
     input=document.getElementById('r7-import-local-input');
     if(!input){
      input=document.createElement('input');input.type='file';
-     input.id='r7-import-local-input';input.accept='.json,application/json';input.hidden=true;
+     input.id='r7-import-local-input';input.accept='.json,.txt,.md,application/json,text/plain,text/markdown';input.hidden=true;
      input.onchange=function(){loadFormatFile(this);};
      document.body.appendChild(input);
     }
@@ -10059,84 +10371,24 @@ function r7MakeDownloadName(includeImage,includeSounds){
 function r7IsMobile(){
  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent||'');
 }
+/* FILE_IO_ADAPTER: timer-v3 original r7BuildExportBlob / r7MakeDownloadName
+ * produce normal FORMAT, portable-layout JSON and Debug; all three use only
+ * r7DeliverExport -> DCFileIO.present with profile="timer". Raw bytes are
+ * sliced <=256KiB, written binary/base64 per slice, stat-checked and
+ * committed by partial -> rename -> URI on Android native. No .text()
+ * conversion at any size; no writer-level JSON serialization.
+ * Ordinary FORMAT <=5MiB; portable JSON <=96MiB; separate background
+ * media library single image <=80MiB/total <=256MiB. >8MiB routes through
+ * DualSettings.prepareImport dedicated File reader; never weaken it.
+ * Keep media omit/include+empty semantics, active MATCH, clocks, sounds,
+ * canvas layers, staged draft, review, and explicit apply unaffected.
+ * Imported TXT/MD must be entire JSON and pass the original Timer parser.
+ * Android Chrome >50MiB: offer download; do not deny Timer generation.
+ */
 async function r7DeliverExport(blob,name){
- var C=typeof Capacitor!=='undefined'?Capacitor:null;
- var native=C&&typeof C.isNativePlatform==='function'&&C.isNativePlatform();
- var nativeError=null;
- if(native){
-  var FS=C.Plugins&&C.Plugins.Filesystem,dir=(C.Plugins&&C.Plugins.Directory&&C.Plugins.Directory.Documents)||'DOCUMENTS';
-  var encoding=(C.Plugins&&C.Plugins.Encoding&&C.Plugins.Encoding.UTF8)||'utf8';
-  if(FS&&typeof FS.writeFile==='function'){
-   var finalPath='Debate-Coach/Timer/'+name,uri=null,stored=false;
-   if(blob.size<=8*1024*1024){
-    try{
-     var result=await FS.writeFile({path:finalPath,data:await blob.text(),directory:dir,
-       encoding,recursive:true});
-     stored=true;uri=result?.uri||null;
-    }catch(e){nativeError=e;}
-   }else{
-    // Large JSON never crosses the Capacitor bridge as one 80 MiB string.
-    var tmp=finalPath+'.partial-'+Date.now().toString(36),written=0;
-    try{
-     if(typeof FS.appendFile!=='function'||typeof FS.rename!=='function')
-      throw Error('当前原生 Filesystem 缺少大文件分块接口');
-     await FS.writeFile({path:tmp,data:'',directory:dir,encoding,recursive:true});
-     var chunk=256*1024;
-     for(var offset=0;offset<blob.size;offset+=chunk){
-      var part=await blob.slice(offset,Math.min(blob.size,offset+chunk)).text();
-      await FS.appendFile({path:tmp,data:part,directory:dir,encoding});
-      written+=new Blob([part]).size;
-     }
-     if(written!==blob.size)throw Error('原生分块输出字节计数不符');
-     if(typeof FS.stat!=='function')throw Error('当前原生 Filesystem 缺少 stat 校验接口');
-     var stat=await FS.stat({path:tmp,directory:dir});
-     if(Number(stat?.size)!==blob.size)throw Error('大文件持久化字节长度不符');
-     await FS.rename({from:tmp,to:finalPath,directory:dir,toDirectory:dir});
-     stored=true;
-     if(typeof FS.getUri==='function')uri=(await FS.getUri({path:finalPath,directory:dir}))?.uri||null;
-    }catch(e){
-     nativeError=e;
-     try{await FS.deleteFile({path:tmp,directory:dir});}catch(cleanup){}
-    }
-   }
-   if(stored){
-    if(!uri&&typeof FS.getUri==='function'){
-     try{uri=(await FS.getUri({path:finalPath,directory:dir}))?.uri||null;}catch(e){}
-    }
-    var Share=C.Plugins&&C.Plugins.Share;
-    if(uri&&Share&&typeof Share.share==='function'){
-     try{
-      await Share.share({title:r6UI('导出配置'),text:r6UI('辩论赛计时器配置'),files:[uri]});
-      return {status:'native-saved-and-shared',path:finalPath,name,bytes:blob.size};
-     }catch(e){
-      return {status:'native-saved-share-unfinished',path:finalPath,name,bytes:blob.size,detail:String(e.message||e)};
-     }
-    }
-    return {status:'native-saved-share-unavailable',path:finalPath,name,bytes:blob.size};
-   }
-  }else nativeError=Error('Capacitor Filesystem unavailable');
- }
- if(typeof navigator!=='undefined'&&r7IsMobile()&&typeof navigator.share==='function'&&
-    typeof navigator.canShare==='function'&&typeof File!=='undefined'){
-  try{
-   var file=new File([blob],name,{type:'application/json'});
-   if(navigator.canShare({files:[file]})){
-    await navigator.share({title:r6UI('导出配置'),files:[file]});
-    return {status:'web-shared',name,bytes:blob.size,nativeError:nativeError?String(nativeError):null};
-   }
-  }catch(e){
-   if(e&&e.name==='AbortError')return {status:'web-share-canceled',name,bytes:blob.size};
-   nativeError=nativeError||e;
-  }
- }
- var anchor=document.createElement('a'),url=URL.createObjectURL(blob);
- try{
-  anchor.href=url;anchor.download=name;anchor.style.display='none';
-  document.body.appendChild(anchor);anchor.click();
- }finally{
-  anchor.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
- }
- return {status:'browser-download-started',name,bytes:blob.size,nativeError:nativeError?String(nativeError.message||nativeError):null};
+  return top.DCFileIO.present({blob,name,mime:blob.type,kind:"json",
+    owner:"timer-v3",lang:LANG,profile:"timer",
+    nativeLocation:{directory:"DOCUMENTS",folder:"Debate-Coach/Timer"}});
 }
 function r7ShowExportChoice(){
  if(!r6Editor||document.getElementById('r7-export-choice'))return;
@@ -10157,12 +10409,14 @@ function r7ShowExportChoice(){
  r6Editor.appendChild(root);root.querySelector('input')?.focus();
 }
 function r8ReportDelivery(result){
- var status=result.status,name=result.name||'';
- if(status==='native-saved-and-shared')r6Message('文件已保存到应用文档，系统分享流程已返回：'+result.path);
- else if(status.startsWith('native-saved'))r6Message('已保存到应用文档：'+result.path+'；分享未完成或不可用。');
- else if(status==='web-shared')r6Message('系统文件分享流程已返回：'+name);
- else if(status==='web-share-canceled')r6Message('已取消文件分享，未启动额外下载');
- else r6Message('已发起浏览器下载（不代表保存成功）：'+name+(result.nativeError?'；原生保存失败：'+result.nativeError:''));
+  var name=result.originalName||result.name||"",status=result.status||"failed";
+  if(status==="share-returned")r6Message("系统分享已返回，请核对接收位置："+name);
+  else if(status==="saved")r6Message("文件已保存到指定位置："+name);
+  else if(status==="download-started")r6Message("已发起浏览器下载（不代表保存成功）："+name);
+  else if(status==="cancelled")r6Message("已取消文件操作，未自动下载："+name);
+  else if(status==="share-not-completed")r6Message("系统分享未完成，未自动下载："+name);
+  else if(status==="unsupported")r6Message("此设备不支持所选操作，请改选原文件下载："+name);
+  else r6Message("导出失败："+(result.message||result.errorName||status));
 }
 function r8ShowPreparedExport(){
  if(!r6Editor||!r8PreparedExport)return;
@@ -10743,7 +10997,7 @@ function r6RenderEditor(){
   '<p id="r6-status" role="status" class="r6-status">'+r6SafeText(r6LastError)+'</p></div>'+
   body+'</div></aside></div>'+
   '<input id="r6-image-file" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>'+
-  '<input id="r6-import-file" type="file" accept=".json,application/json" hidden>'+ 
+  '<input id="r6-import-file" type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" hidden>'+ 
   '<input id="r11-sound-warn-file" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav" hidden>'+ 
   '<input id="r11-sound-end-file" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav" hidden></div>';
  r6Editor.innerHTML=h;window.DualSettings.mountBar(r6Editor,'native');
