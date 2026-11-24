@@ -1675,59 +1675,11 @@ html[data-stage-kind="display"] .app{height:100vh;height:100dvh}
 
 </style>
 <script>
-/*
-COACH_FILE_IO_ARCHITECTURE_CONTRACT_BEGIN
-R01 SINGLE-FILE COACH FILE DELIVERY CONTRACT (source-owned, not a help page).
-SCOPE: createCoachFileIO(environment) is the one shared file delivery/receipt service,
-installed as window.DCFileIO in the executable Coach shell. AI Recorder is excluded.
-OWNERSHIP: Module producers alone own payload bytes, original name, MIME, JSON
-schema, IDs, links, history, session state and import validation/commit.
-The service accepts a canonical Blob once; it does NOT serialize JSON, repair
-invalid inputs, alter report content, commit a project, or inspect prompts.
-API: present(PreparedFile) offers supported actions; deliver(PreparedFile,
-'download'|'share'|'save-local') performs exactly one intent; openPreview()
-starts read-only HTML preview; standaloneSource() emits this same self-contained
-factory for Atlas/Startrack offline reports. PreparedFile: {blob,name,mime,kind,
-owner,lang,nativeLocation:{directory,folder},profile:'ordinary'|'timer'}.
-Receipt.status: download-started, preview-open-started, share-returned, saved,
-cancelled, share-not-completed, unsupported, failed. A resolved Promise or an
-anchor.click does not establish that the destination file was saved.
-WEB: iOS HTTPS uses navigator.share({files:[File]}) ONLY, never title/text;
-JSON/MD may use text/plain MIME without changing extension. Android Web JSON/MD
-share uses byte-identical .json.txt/.md.txt and text/plain regardless of
-canShare(original); original extension is retained for downloads. Unsupported
-Web Share falls back to a *user-selected* download, not a silent retry. Explicit
-cancellation/failure NEVER auto-downloads. Asynchronously prepared exports wait
-for a NEW user click before Web Share; no await before navigator.share.
-NATIVE: Use existing Capacitor Filesystem -> URI -> Share or test-only LocalSave
-(SAF). Write raw Blob bytes in <=256 KiB slices, Base64 encode each slice, await
-writeFile then serial appendFile without encoding. Verify raw byte count/stat;
-Timer uses partial -> stat -> rename -> URI while ordinary files use the prior
-direct target. Preserve original per-module DOCUMENTS/CACHE folder. Do not
-decode entire Blob as text, build whole-file Base64, or share partial files.
-INPUT: JSON can be carried in .json/.txt/.md only if the ENTIRE contents parse
-as JSON (remove only one leading BOM); original module parser/validator commits
-or rejects. Genuine Markdown reports (especially Judge) have independent
-report import paths; no code-fence extraction or LLM JSON repair.
-FILE MATRIX: JSON/MD/TXT/HTML/CSV/SVG keep actual bytes/MIME; XLSX, JPG,
-PNG/audio/other binary MUST keep real bytes and extensions, never TXT aliases.
-No new PDF/ZIP generators are implied; existing HTML preview/print is separate.
-LARGE TIMER: ordinary format <=5 MiB; portable JSON <=96 MiB; display-image
-library single image <=80 MiB and total <=256 MiB is a different data domain.
-8 MiB selects Timer's dedicated large-file *import parser*, not an export cap.
-Android Chromium browser Web Share currently gates files over 50 MiB to the
-normal download action; this is NOT a Timer generation/import limit. Never
-change MATCH/FORMAT, clocks, sounds, media inclusion semantics, canvas or
-explicit settings application in an I/O change.
-FAILURES: One prepared file, one user intent, one Receipt. Cancelled share or SAF
-save must not report success or cause a second action. No global a.click/Blob/
-JSON.parse intercepts, duplicate delivery services, extra schema engine,
-persistent file cache, external file dependency, or Recorder coupling.
-MAINTENANCE: When changing a service interface, edit this comment; when a
-module exception changes, edit its FILE_IO_ADAPTER comment near the real code.
-Real execution code and current project rules outrank stale comments/line IDs.
-COACH_FILE_IO_ARCHITECTURE_CONTRACT_END
-*/
+/* FILE_IO_ADAPTER: Standalone Timer R01. Business/Timer JS and file
+ * delivery executable code are unchanged. Full architecture contract:
+ * implementation/shared-file-delivery.js, under this project.
+ * Timer large-file/portable import/export semantics remain authoritative.
+ */
 function createCoachFileIO(environment) {
   'use strict';
   const host=environment||window;
